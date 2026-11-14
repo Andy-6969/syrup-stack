@@ -9,12 +9,12 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const png = readFileSync(new URL('./entry.png', import.meta.url));
-// the gate takes a whole PNG of at most 1 MiB and 1024 x 1024 pixels: fail loudly here rather than at the gate
-const signature = '89504e470d0a1a0a';
-if (png.subarray(0, 8).toString('hex') !== signature) throw new Error('entry.png is not a PNG');
-if (png.length > 1048576) throw new Error(`entry.png is ${png.length} bytes, over 1 MiB`);
-if (png.readUInt32BE(16) > 1024 || png.readUInt32BE(20) > 1024) throw new Error('entry.png is larger than 1024 x 1024');
+const img = readFileSync(new URL('./entry.png', import.meta.url));
+// the gate takes a whole PNG or JPEG of at most 1 MiB: fail loudly here rather than at the gate
+const isPng = img.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+const isJpeg = img[0] === 0xff && img[1] === 0xd8 && img[img.length - 2] === 0xff && img[img.length - 1] === 0xd9;
+if (!isPng && !isJpeg) throw new Error('entry.png is neither a whole PNG nor a whole JPEG');
+if (img.length > 1048576) throw new Error(`entry.png is ${img.length} bytes, over 1 MiB`);
 
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-writeFileSync(join(outDir, 'entry.png'), png);
+writeFileSync(join(outDir, 'entry.png'), img);

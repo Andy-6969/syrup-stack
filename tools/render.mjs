@@ -7,7 +7,8 @@
 // Every random choice comes from fixed seeds, so the same command always writes the same bytes.
 
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, unlinkSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
 import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 const W = Number(process.env.W || 1024);
 const H = W;
 const SPP = Number(process.env.SPP || 24);
+const GRAIN = Number(process.env.GRAIN ?? 0.022);
 
 // ---------------------------------------------------------------- small math
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -138,6 +140,8 @@ function sdPancake(x, y, z, P) {
 function sdStack(x, y, z) {
   let d = 1e9;
   for (let i = 0; i < NP; i++) { const di = sdPancake(x, y, z, pans[i]); if (di < d) d = di; }
+  // hand-poured batter is never a perfect disc: a soft lumpy displacement
+  if (d < 0.08) d += smooth(0.08, 0.03, d) * (0.007 * (vnoise(x * 5 + 3, y * 5, z * 5) - 0.5) + 0.003 * (vnoise(x * 13, y * 13, z * 13 + 5) - 0.5));
   return d;
 }
 function wrapPi(a) { a %= 2 * Math.PI; if (a > Math.PI) a -= 2 * Math.PI; if (a < -Math.PI) a += 2 * Math.PI; return a; }
@@ -167,8 +171,9 @@ function syrupThickness(x, y, z, th) {
     }
   }
   if (y > TOP.y) dc = Math.min(dc, s - pool);
-  const t = clamp(-dc / 0.045, 0, 1);
-  return SYR_T * Math.sqrt(t) + bulb;
+  // syrup thins out towards its edges instead of ending in a rounded tube
+  const t = clamp(-dc / 0.06, 0, 1);
+  return SYR_T * t ** 0.75 + bulb * 0.7;
 }
 
 function sdRoundBoxLocal(qx, qy, qz, hx, hy, hz, r) {
@@ -385,17 +390,37 @@ function pancakeAlbedo(x, y, z, ny, P) {
   const fr = mix(0.42, 0.8, br), fg = mix(0.18, 0.44, br), fb = mix(0.04, 0.13, br);
   // the side: golden crumb
   const sv = vnoise(x * 18, y * 18, z * 18);
-  const sr = mix(0.86, 0.91, sv), sg = mix(0.6, 0.66, sv), sb = mix(0.28, 0.34, sv);
-  // fine air pores in the crumb
-  const pore = smooth(0.8, 0.88, vnoise(x * 95, y * 95, z * 95));
-  const pr = sr * (1 - 0.18 * pore), pg = sg * (1 - 0.24 * pore), pb = sb * (1 - 0.3 * pore);
-  // a caramelised ring where the face turns into the side
-  const ring = 1 - 0.22 * Math.exp(-(((ay - 0.42) / 0.16) ** 2));
-  return [mix(pr, fr, face) * ring, mix(pg, fg, face) * ring * ring, mix(pb, fb, face) * ring * ring];
+  const sr = mix(0.85, 0.9, sv), sg = mix(0.57, 0.63, sv), sb = mix(0.25, 0.3, sv);
+  // open air pockets of the crumb: dark little holes
+  const pore = crumbHoles(x, y, z);
+  const pr = sr * (1 - 0.3 * pore), pg = sg * (1 - 0.38 * pore), pb = sb * (1 - 0.45 * pore);
+  // a caramelised, uneven crust where the face turns into the side
+  const lace = fbm(x * 7 + 2, y * 7, z * 7, 4);
+  const f2 = clamp(face + smooth(0.08, 0.5, ay) * smooth(0.5, 0.75, lace) * 0.8, 0, 1);
+  const m = 1 - pore * face * 0.5;
+  return [mix(pr, fr, f2) * m, mix(pg, fg, f2) * m, mix(pb, fb, f2) * m];
 }
 
+// cellular noise: distance to the nearest of one random point per cell
+function worley(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  let best = 9;
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+    const cx = ix + a, cy = iy + b, cz = iz + c;
+    const px = cx + hash3(cx, cy, cz), py = cy + hash3(cx + 31, cy, cz), pz = cz + hash3(cx, cy + 57, cz);
+    const d = (px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2;
+    if (d < best) best = d;
+  }
+  return Math.sqrt(best);
+}
+function crumbHoles(x, y, z) {
+  // two sizes of bubbles, only some cells open into a hole
+  const a = 1 - smooth(0.2, 0.3, worley(x * 30, y * 30, z * 30));
+  const b = 1 - smooth(0.12, 0.2, worley(x * 75 + 9, y * 75, z * 75));
+  return clamp(a * smooth(0.5, 0.65, vnoise(x * 9, y * 9, z * 9)) * 0.8 + b * 0.3, 0, 1);
+}
 function pancakeHeight(x, y, z) {
-  return 0.003 * fbm(x * 9, y * 9, z * 9, 3) - 0.00012 * smooth(0.8, 0.88, vnoise(x * 95, y * 95, z * 95)) + 0.0004 * vnoise(x * 60, y * 60, z * 60);
+  return 0.003 * fbm(x * 9, y * 9, z * 9, 3) - 0.0018 * crumbHoles(x, y, z) + 0.0004 * vnoise(x * 60, y * 60, z * 60);
 }
 
 function syrupRipple(x, y, z) {
@@ -481,15 +506,15 @@ function shade(px, py, pz, dx, dy, dz, hitTable) {
         const cd = (cx * ax + cy * ay + cz * az) / cl;
         const crown = smooth(0.9, 0.96, cd);
         const bloom = fbm(px * 25, py * 25, pz * 25, 3);
-        const dust = clamp(0.25 + bloom * 0.6, 0, 1);
+        const dust = clamp(0.3 + (bloom - 0.5) * 1.4 + 0.25, 0, 1);
         alb = [mix(0.045, 0.2, dust) * (1 - 0.6 * crown), mix(0.05, 0.22, dust) * (1 - 0.6 * crown), mix(0.13, 0.36, dust) * (1 - 0.5 * crown)];
         rough = mix(0.32, 0.55, dust); f0 = 0.04;
         break;
       }
       case M_RASP: {
         const v = vnoise(px * 40, py * 40, pz * 40);
-        alb = [mix(0.62, 0.78, v), mix(0.03, 0.06, v), mix(0.07, 0.11, v)];
-        rough = 0.24; f0 = 0.04; wrap = 0.5; sss = 0.9;
+        alb = [mix(0.6, 0.8, v), mix(0.035, 0.07, v), mix(0.08, 0.12, v)];
+        rough = 0.2; f0 = 0.04; wrap = 0.6; sss = 1.5;
         break;
       }
       case M_MINT: {
@@ -511,8 +536,18 @@ function shade(px, py, pz, dx, dy, dz, hitTable) {
         rough = 0.45; f0 = 0.03;
       }
     }
+    // a light dusting of icing sugar over the stack and the plate (it melts away on the wet syrup)
+    if (n[1] > 0.3) {
+      const r2 = Math.hypot(px, pz);
+      const wet = m.id === M_SYRUP || m.id === M_STREAM ? 0.1 : m.id === M_PLATE ? 0.55 : 1;
+      const dens = smooth(2.0, 0.5, r2) * smooth(0.3, 0.75, n[1]) * wet;
+      const gs = 0.6 * vnoise(px * 150, py * 150, pz * 150) + 0.4 * vnoise(px * 31 + 4, py * 31, pz * 31);
+      const sug = smooth(0.6, 0.7, gs) * dens;
+      if (sug > 0) { alb = [mix(alb[0], 0.94, sug), mix(alb[1], 0.93, sug), mix(alb[2], 0.9, sug)]; rough = mix(rough, 0.9, sug); }
+    }
     occ = ambientOcc(px, py, pz, n[0], n[1], n[2]);
   }
+  LAST_ALB = alb; LAST_N = n;
   const [nx, ny, nz] = n;
   let r = 0, g = 0, b = 0;
   const lights = [[KEY, KEYC, 9], [FILL, FILLC, 5], [RIM, RIMC, 7]];
@@ -534,7 +569,7 @@ function shade(px, py, pz, dx, dy, dz, hitTable) {
   }
   // soft light from the room
   const amb = (0.55 + 0.45 * ny) * occ;
-  r += alb[0] * amb * 0.075; g += alb[1] * amb * 0.063; b += alb[2] * amb * 0.055;
+  r += alb[0] * amb * 0.045; g += alb[1] * amb * 0.038; b += alb[2] * amb * 0.033;
   // reflection of the studio
   const ndv = Math.max(0, nx * vx + ny * vy + nz * vz);
   const rd = 2 * ndv;
@@ -566,10 +601,10 @@ function background(dx, dy, dz) {
 }
 
 // ---------------------------------------------------------------- camera and tracing
-const CAM_T = [0, 0.72, 0.05];
+const CAM_T = [0, 0.76, 0.05];
 const CAM_DIST = 5.7, CAM_EL = 0.34, CAM_AZ = 0.18;
 const CAM_E = [CAM_T[0] + CAM_DIST * Math.cos(CAM_EL) * Math.sin(CAM_AZ), CAM_T[1] + CAM_DIST * Math.sin(CAM_EL), CAM_T[2] + CAM_DIST * Math.cos(CAM_EL) * Math.cos(CAM_AZ)];
-const FOV = 0.56;
+const FOV = 0.5;
 const FOCUS = len3(CAM_E[0] - 0.1, CAM_E[1] - 1.1, CAM_E[2] - 0.6);
 const APERTURE = 0.055;
 
@@ -601,10 +636,32 @@ function traceScene(ox, oy, oz, dx, dy, dz) {
   return -1;
 }
 
-function radiance(ox, oy, oz, dx, dy, dz) {
+let LAST_ALB = [0, 0, 0], LAST_N = [0, 1, 0], BR1 = 0.5, BR2 = 0.5;
+
+// one bounce of diffuse light: warm light from the pancakes spills onto their neighbours and the plate
+function bounce(px, py, pz, c) {
+  const alb = LAST_ALB, n = LAST_N;
+  // cosine-weighted direction around the normal
+  const a = 2 * Math.PI * BR1, r = Math.sqrt(BR2);
+  const tx = Math.abs(n[0]) < 0.9 ? 1 : 0, ty = tx ? 0 : 1;
+  let ux = ty * n[2], uy = -tx * n[2], uz = tx * n[1] - ty * n[0];
+  const ul = len3(ux, uy, uz); ux /= ul; uy /= ul; uz /= ul;
+  const vx = n[1] * uz - n[2] * uy, vy = n[2] * ux - n[0] * uz, vz = n[0] * uy - n[1] * ux;
+  const k = Math.sqrt(Math.max(0, 1 - BR2));
+  const dx = ux * r * Math.cos(a) + vx * r * Math.sin(a) + n[0] * k, dy = uy * r * Math.cos(a) + vy * r * Math.sin(a) + n[1] * k, dz = uz * r * Math.cos(a) + vz * r * Math.sin(a) + n[2] * k;
+  const li = radiance(px + n[0] * 0.006, py + n[1] * 0.006, pz + n[2] * 0.006, dx, dy, dz, 1);
+  return [c[0] + alb[0] * li[0] * 0.8, c[1] + alb[1] * li[1] * 0.8, c[2] + alb[2] * li[2] * 0.8];
+}
+
+function radiance(ox, oy, oz, dx, dy, dz, depth = 0) {
   const ts = traceScene(ox, oy, oz, dx, dy, dz);
   const tt = dy < 0 ? (TABLE_Y - oy) / dy : -1;
-  if (ts > 0 && (tt < 0 || ts < tt)) return shade(ox + dx * ts, oy + dy * ts, oz + dz * ts, dx, dy, dz, false);
+  if (ts > 0 && (tt < 0 || ts < tt)) {
+    const px = ox + dx * ts, py = oy + dy * ts, pz = oz + dz * ts;
+    const c = shade(px, py, pz, dx, dy, dz, false);
+    return depth === 0 ? bounce(px, py, pz, c) : c;
+  }
+  if (depth > 0) return tt > 0 ? [0.01, 0.006, 0.004] : background(dx, dy, dz);
   if (tt > 0) {
     const px = ox + dx * tt, pz = oz + dz * tt;
     const c = shade(px, TABLE_Y, pz, dx, dy, dz, true);
@@ -633,6 +690,7 @@ function renderRows(rows) {
       for (let s = 0; s < SPP; s++) {
         const j1 = hash3(px, py, s * 3 + 1), j2 = hash3(px, py, s * 3 + 2), j3 = hash3(px, py, s * 3 + 3), j4 = hash3(py, px, s * 7 + 5);
         JIT = hash3(px + 7919, py, s * 5 + 11);
+        BR1 = hash3(px, py + 4099, s * 5 + 13); BR2 = hash3(px + 151, py + 7, s * 5 + 17);
         const sx = ((s % sq) + j1) / sq, sy = ((Math.floor(s / sq) % sq) + j2) / sq;
         const u = ((px + sx) / W * 2 - 1) * tanH, v = (1 - (py + sy) / H * 2) * tanH;
         let dx = fx + rx * u + ux * v, dy = fy + ry * u + uy * v, dz = fz + rz * u + uz * v;
@@ -678,10 +736,13 @@ function postProcess(hdr) {
     const o = (y * W + x) * 3;
     const ddx = (x + 0.5) / W - 0.5, ddy = (y + 0.5) / H - 0.48;
     const vig = 1 - 0.55 * Math.min(1, (ddx * ddx + ddy * ddy) * 2.2) ** 1.5;
-    const ex = 1.15;
+    const ex = 1.2;
+    // fine film grain, the same in every channel, strongest in the mid-tones
+    const grain = (hash3(x, y, 99) + hash3(x, y, 101) - 1) * GRAIN;
     for (let c = 0; c < 3; c++) {
       let v = (hdr[o + c] + bright[o + c] * 0.35) * vig * ex;
       v = srgb(aces(v));
+      v += grain * (0.35 + v * (1 - v) * 2.6);
       px[o + c] = clamp(Math.round(v * 255), 0, 255);
     }
   }
@@ -738,8 +799,16 @@ if (isMainThread) {
   })));
   const png = encodePNG(postProcess(hdr));
   const out = process.env.OUT || fileURLToPath(new URL('../entry.png', import.meta.url));
-  writeFileSync(out, png);
-  console.log(`${out}: ${W}x${H}, ${SPP} spp, ${png.length} bytes, ${((Date.now() - t0) / 1000).toFixed(1)} s on ${n} threads`);
+  if (process.env.JPEG === '0') writeFileSync(out, png);
+  else {
+    // film grain does not compress as PNG under the 1 MiB cap: store the picture as a high-quality JPEG
+    // (4:4:4, no chroma subsampling). The gate tells PNG from JPEG by the first bytes; the name stays entry.png.
+    const tmp = `${out}.tmp.png`;
+    writeFileSync(tmp, png);
+    execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-i', tmp, '-c:v', 'mjpeg', '-q:v', process.env.JPEGQ || '2', '-pix_fmt', 'yuvj444p', '-f', 'image2', out]);
+    unlinkSync(tmp);
+  }
+  console.log(`${out}: ${W}x${H}, ${SPP} spp, ${statSync(out).size} bytes, ${((Date.now() - t0) / 1000).toFixed(1)} s on ${n} threads`);
 } else {
   parentPort.postMessage(renderRows(workerData.rows));
 }

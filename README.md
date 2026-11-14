@@ -9,7 +9,7 @@ A stack of fluffy pancakes with maple syrup pouring over a melting pat of butter
 ## Run it
 
 ```sh
-node tools/render.mjs                      # rebuild entry.png (about two minutes on 20 cores)
+node tools/render.mjs                      # rebuild entry.png (about three minutes on 20 cores; ffmpeg encodes the JPEG)
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
